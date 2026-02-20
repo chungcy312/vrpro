@@ -1,0 +1,16 @@
+name: vfm-feature
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.1
+  - torchvision>=0.16
+  - numpy
+  - pyyaml
+  - pip
+  - pip:
+      - decord
+      - timm>=1.0
+      - opencv-python

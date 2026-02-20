@@ -37,6 +37,56 @@
 - `__init__.py`
   - 封裝模組匯出符號
 
+- `envs/environment.train.yaml`
+  - `train.py` 使用環境
+
+- `envs/environment.encode.yaml`
+  - `encode.py` 使用環境
+
+- `envs/environment.vfm_feature.yaml`
+  - `vfm_feature.py` 使用環境（包含影片解碼與 VFM 相關套件）
+
+---
+
+## 環境設定
+
+### 腳本與環境對應
+
+- `train.py` -> `envs/environment.train.yaml`
+- `encode.py` -> `envs/environment.encode.yaml`
+- `vfm_feature.py` -> `envs/environment.vfm_feature.yaml`
+
+### 建立環境
+
+在 `vfm_encoder` 目錄下執行：
+
+```bash
+conda env create -f envs/environment.train.yaml
+conda env create -f envs/environment.encode.yaml
+conda env create -f envs/environment.vfm_feature.yaml
+```
+
+若環境已存在，改用 update：
+
+```bash
+conda env update -f envs/environment.train.yaml --prune
+conda env update -f envs/environment.encode.yaml --prune
+conda env update -f envs/environment.vfm_feature.yaml --prune
+```
+
+### 啟用環境
+
+```bash
+conda activate vfm-train
+conda activate vfm-encode
+conda activate vfm-feature
+```
+
+說明：
+
+- 若你只跑訓練與編碼，使用 `vfm-train` / `vfm-encode` 即可
+- 若你要從影片抽 VFM 特徵，請使用 `vfm-feature`
+
 ---
 
 ## 資料格式
@@ -64,13 +114,15 @@
 在 `vfm_encoder` 目錄下執行：
 
 ```bash
-/home/hpc/ce505215/.conda/envs/cogvideox/bin/python vfm_feature.py --allow_skip_missing
+conda activate vfm-feature
+python vfm_feature.py --allow_skip_missing
 ```
 
 只抽指定模型（例如 VideoMAEv2）：
 
 ```bash
-/home/hpc/ce505215/.conda/envs/cogvideox/bin/python vfm_feature.py \
+conda activate vfm-feature
+python vfm_feature.py \
   --models VideoMAEv2 \
   --allow_skip_missing
 ```
@@ -85,7 +137,8 @@
 ### 2) 用 VFM 特徵訓練 motion encoder
 
 ```bash
-/home/hpc/ce505215/.conda/envs/cogvideox/bin/python train.py \
+conda activate vfm-train
+python train.py \
   --feature_dir ../dataset/vfm_features_motion_top100/VideoMAEv2 \
   --save_dir ./checkpoints_videomaev2 \
   --input_dim 768 \
@@ -99,7 +152,8 @@
 ### 3) 將單一特徵檔壓縮成 latent
 
 ```bash
-/home/hpc/ce505215/.conda/envs/cogvideox/bin/python encode.py \
+conda activate vfm-encode
+python encode.py \
   --checkpoint ./checkpoints_videomaev2/motion_ae_epoch10.pt \
   --input ../dataset/vfm_features_motion_top100/VideoMAEv2/0000.pt \
   --output ../dataset/vfm_features_motion_top100/VideoMAEv2_motion/0000.pt \
