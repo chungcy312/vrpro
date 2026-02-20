@@ -2,4 +2,4 @@ dataset/
 *.pt
 
 # Ignore all files and folders starting with 'checkpoint' in any directory
-**/checkpoint*/
+**/*checkpoint*/
