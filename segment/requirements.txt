@@ -1,0 +1,7 @@
+torch
+transformers>=4.44.0
+timm
+opencv-python
+pillow
+numpy
+tqdm
