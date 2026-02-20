@@ -164,6 +164,103 @@ python encode.py \
 
 ---
 
+## CLI 參數說明（argparse）
+
+本節整理所有有 `argparse` 的腳本參數。
+
+### `train.py`
+
+- `--feature_dir` (`Path`, 必填)
+  - 訓練特徵資料夾，遞迴讀取 `.pt/.pth/.npy`
+- `--save_dir` (`Path`, 預設 `./checkpoints`)
+  - checkpoint 輸出資料夾
+- `--input_dim` (`int`, 預設 `768`)
+  - 輸入特徵通道維度 `C`
+- `--model_dim` (`int`, 預設 `384`)
+  - 編碼器/解碼器中間維度
+- `--latent_dim` (`int`, 預設 `192`)
+  - 壓縮後維度
+- `--num_heads` (`int`, 預設 `8`)
+  - Transformer attention heads
+- `--num_layers` (`int`, 預設 `2`)
+  - Transformer layer 數
+- `--dropout` (`float`, 預設 `0.1`)
+  - 模型 dropout
+- `--epochs` (`int`, 預設 `10`)
+  - 訓練 epochs
+- `--batch_size` (`int`, 預設 `2`)
+  - batch size
+- `--lr` (`float`, 預設 `2e-4`)
+  - learning rate
+- `--weight_decay` (`float`, 預設 `1e-4`)
+  - optimizer weight decay
+- `--num_workers` (`int`, 預設 `4`)
+  - DataLoader workers
+- `--recon_weight` (`float`, 預設 `1.0`)
+  - reconstruction loss 權重
+- `--motion_weight` (`float`, 預設 `1.0`)
+  - temporal difference loss 權重
+- `--smooth_weight` (`float`, 預設 `0.05`)
+  - latent smoothness loss 權重
+- `--use_token` (`flag`, 預設關閉)
+  - 開啟後 encoder 輸入為 `[x, delta_x]` 拼接
+
+### `encode.py`
+
+- `--checkpoint` (`Path`, 必填)
+  - 訓練完成的模型權重檔
+- `--input` (`Path`, 必填)
+  - 單一輸入特徵檔（`.pt/.pth/.npy`）
+- `--output` (`Path`, 必填)
+  - 輸出路徑（儲存 `latent`、`motion_embedding`）
+- `--input_dim` (`int`, 預設 `768`)
+  - 輸入特徵通道維度 `C`
+- `--model_dim` (`int`, 預設 `384`)
+  - 中間維度
+- `--latent_dim` (`int`, 預設 `192`)
+  - 壓縮維度
+- `--num_heads` (`int`, 預設 `8`)
+  - Transformer attention heads
+- `--num_layers` (`int`, 預設 `2`)
+  - Transformer layer 數
+- `--dropout` (`float`, 預設 `0.1`)
+  - dropout
+- `--use_token` (`flag`, 預設關閉)
+  - 與訓練時設定一致時應開啟
+
+### `vfm_feature.py`
+
+- `--video_dir` (`Path`, 預設 `../dataset/motion_top100`)
+  - 影片來源資料夾
+- `--csv_path` (`Path`, 預設 `../dataset/motion_top100.csv`)
+  - caption CSV（用於寫入輸出 metadata）
+- `--output_root` (`Path`, 預設 `../dataset/vfm_features_motion_top100`)
+  - 特徵輸出根目錄
+- `--models` (`str[]`, 預設 `VideoMAEv2 VideoMAE DINOv2 VJEPA2`)
+  - 要抽取的 VFM 模型列表
+- `--device` (`str`, 預設自動：有 GPU 用 `cuda`，否則 `cpu`)
+  - 推論裝置
+- `--num_frames` (`int`, 預設 `48`)
+  - 每支影片抽樣幀數
+- `--videomae_resize_h` (`int`, 預設 `160`)
+  - VideoMAE/VideoMAEv2/VJEPA2 前處理高度
+- `--videomae_resize_w` (`int`, 預設 `240`)
+  - VideoMAE/VideoMAEv2/VJEPA2 前處理寬度
+- `--dinov2_resize_h` (`int`, 預設 `420`)
+  - DINOv2 前處理高度
+- `--dinov2_resize_w` (`int`, 預設 `630`)
+  - DINOv2 前處理寬度
+- `--dinov2_chunk` (`int`, 預設 `128`)
+  - DINOv2 分塊推論大小（避免 OOM）
+- `--videomaev2_ckpt` (`Path`, 預設 `VideoREPA/ckpt/VideoMAEv2/vit_b_k710_dl_from_giant.pth`)
+  - VideoMAEv2 權重路徑
+- `--videomae_ckpt` (`Path`, 預設 `VideoREPA/ckpt/VideoMAE/k400_videomae_pretrain_base_patch16_224_frame_16x4_tube_mask_ratio_0_9_e1600.pth`)
+  - VideoMAE 權重路徑
+- `--allow_skip_missing` (`flag`, 預設關閉)
+  - 模型缺權重/缺依賴時改為跳過，不中斷整批
+
+---
+
 ## 維度建議
 
 當 VFM channel dimension 為 `C=768`：

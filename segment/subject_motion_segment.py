@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import re
 from dataclasses import dataclass
@@ -111,6 +112,12 @@ def parse_args() -> argparse.Namespace:
         help="Process one frame every N frames",
     )
     parser.add_argument(
+        "--sample_interval_sec",
+        type=float,
+        default=0.0,
+        help="If > 0, sample one frame every given seconds (overrides frame_stride)",
+    )
+    parser.add_argument(
         "--max_frames_per_video",
         type=int,
         default=0,
@@ -147,6 +154,60 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0004,
         help="Filter tiny detections by area/image_area",
+    )
+    parser.add_argument(
+        "--max_box_area_ratio",
+        type=float,
+        default=0.45,
+        help="Suppress over-large boxes (e.g., whole field/screen)",
+    )
+    parser.add_argument(
+        "--subtitle_bottom_ratio",
+        type=float,
+        default=0.22,
+        help="Bottom area ratio used to suppress subtitle-like boxes",
+    )
+    parser.add_argument(
+        "--subtitle_aspect_ratio",
+        type=float,
+        default=4.5,
+        help="Wide aspect ratio threshold for subtitle-like boxes",
+    )
+    parser.add_argument(
+        "--motion_weight",
+        type=float,
+        default=0.8,
+        help="Weight of per-box motion score when selecting primary",
+    )
+    parser.add_argument(
+        "--temporal_iou_weight",
+        type=float,
+        default=0.7,
+        help="Weight of IoU with previous primary box for temporal consistency",
+    )
+    parser.add_argument(
+        "--min_motion_score",
+        type=float,
+        default=0.10,
+        help="Low-motion boxes are penalized to avoid static background/text",
+    )
+    parser.add_argument(
+        "--smooth_alpha",
+        type=float,
+        default=0.65,
+        help="EMA smoothing factor for primary box coordinates",
+    )
+    parser.add_argument(
+        "--max_center_jump_ratio",
+        type=float,
+        default=0.2,
+        help="Maximum center jump ratio (of image diagonal) allowed in one step",
+    )
+    parser.add_argument(
+        "--track_hold_frames",
+        type=int,
+        default=4,
+        help="Keep last smoothed primary box this many frames when temporary miss happens",
     )
     parser.add_argument(
         "--save_mask_png",
@@ -226,7 +287,11 @@ def lm_extract_subjects(caption: str, tokenizer, model, device: str) -> Tuple[Li
     prompt = (
         "Extract visual entities from this caption for object localization. "
         "Return strict JSON with keys primary and context, each as list of short noun phrases. "
-        "primary must contain the main moving subject; context contains interacted object/surface if explicit. "
+        "Use ONLY concrete, boxable objects (e.g., person, player, ball, motorcycle). "
+        "Do NOT output actions/verbs/adjectives (e.g., running, scoring, giving instructions), "
+        "nor scene-level regions (e.g., field, grassland, sky) unless directly contacted by primary. "
+        "Do NOT output subtitles, text, caption, logo, watermark, UI, screen text. "
+        "primary must contain main moving object nouns only; context optional for directly interacted object/surface. "
         f"Caption: {caption}"
     )
     inputs = tokenizer(text=prompt, return_tensors="pt", truncation=True)
@@ -289,7 +354,7 @@ def detect_boxes(
     if not labels:
         return []
 
-    text = [[f"{label}." for label in labels]]
+    text = " ".join(f"{label}." for label in labels)
     inputs = det_processor(images=image, text=text, return_tensors="pt")
     if device.startswith("cuda"):
         inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -300,7 +365,7 @@ def detect_boxes(
     target_sizes = torch.tensor([image.size[::-1]])
     results = det_processor.post_process_grounded_object_detection(
         outputs,
-        inputs.input_ids,
+        inputs["input_ids"],
         box_threshold=box_threshold,
         text_threshold=text_threshold,
         target_sizes=target_sizes,
@@ -324,17 +389,192 @@ def detect_boxes(
     return detections
 
 
+def box_area_ratio(box_xyxy: Tuple[float, float, float, float], image_w: int, image_h: int) -> float:
+    x1, y1, x2, y2 = box_xyxy
+    area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return area / float(max(1, image_w * image_h))
+
+
+def is_subtitle_like(
+    box_xyxy: Tuple[float, float, float, float],
+    image_w: int,
+    image_h: int,
+    subtitle_bottom_ratio: float,
+    subtitle_aspect_ratio: float,
+) -> bool:
+    x1, y1, x2, y2 = box_xyxy
+    width = max(1e-6, x2 - x1)
+    height = max(1e-6, y2 - y1)
+    cy = (y1 + y2) * 0.5
+    aspect = width / height
+    in_bottom = cy >= (1.0 - subtitle_bottom_ratio) * image_h
+    return in_bottom and aspect >= subtitle_aspect_ratio and height <= 0.12 * image_h
+
+
+def compute_motion_map(prev_gray: Optional[np.ndarray], curr_gray: np.ndarray) -> Optional[np.ndarray]:
+    if prev_gray is None:
+        return None
+    flow = cv2.calcOpticalFlowFarneback(
+        prev_gray,
+        curr_gray,
+        None,
+        pyr_scale=0.5,
+        levels=2,
+        winsize=15,
+        iterations=2,
+        poly_n=5,
+        poly_sigma=1.1,
+        flags=0,
+    )
+    mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2)
+    return mag
+
+
+def motion_score_in_box(motion_map: Optional[np.ndarray], box_xyxy: Tuple[float, float, float, float]) -> float:
+    if motion_map is None:
+        return 0.0
+    h, w = motion_map.shape[:2]
+    x1, y1, x2, y2 = box_xyxy
+    ix1 = int(np.clip(np.floor(x1), 0, w - 1))
+    iy1 = int(np.clip(np.floor(y1), 0, h - 1))
+    ix2 = int(np.clip(np.ceil(x2), 1, w))
+    iy2 = int(np.clip(np.ceil(y2), 1, h))
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    roi = motion_map[iy1:iy2, ix1:ix2]
+    mean_mag = float(np.mean(roi))
+    return float(np.clip(mean_mag / 6.0, 0.0, 1.0))
+
+
+def box_iou(a: Tuple[float, float, float, float], b: Tuple[float, float, float, float]) -> float:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    denom = area_a + area_b - inter
+    if denom <= 1e-8:
+        return 0.0
+    return inter / denom
+
+
+def smooth_primary_box(
+    prev_box: Optional[Tuple[float, float, float, float]],
+    curr_box: Tuple[float, float, float, float],
+    alpha: float,
+    max_center_jump_ratio: float,
+    image_w: int,
+    image_h: int,
+) -> Tuple[float, float, float, float]:
+    if prev_box is None:
+        return curr_box
+
+    px1, py1, px2, py2 = prev_box
+    cx1, cy1, cx2, cy2 = curr_box
+
+    prev_cx = 0.5 * (px1 + px2)
+    prev_cy = 0.5 * (py1 + py2)
+    curr_cx = 0.5 * (cx1 + cx2)
+    curr_cy = 0.5 * (cy1 + cy2)
+
+    max_jump = max_center_jump_ratio * np.sqrt(float(image_w * image_w + image_h * image_h))
+    jump = np.sqrt((curr_cx - prev_cx) ** 2 + (curr_cy - prev_cy) ** 2)
+    if jump > max_jump:
+        return prev_box
+
+    a = float(np.clip(alpha, 0.0, 1.0))
+    sx1 = a * cx1 + (1 - a) * px1
+    sy1 = a * cy1 + (1 - a) * py1
+    sx2 = a * cx2 + (1 - a) * px2
+    sy2 = a * cy2 + (1 - a) * py2
+    return (sx1, sy1, sx2, sy2)
+
+
+def interpolate_box(
+    box_a: Tuple[float, float, float, float],
+    box_b: Tuple[float, float, float, float],
+    t: float,
+) -> Tuple[float, float, float, float]:
+    return (
+        (1.0 - t) * box_a[0] + t * box_b[0],
+        (1.0 - t) * box_a[1] + t * box_b[1],
+        (1.0 - t) * box_a[2] + t * box_b[2],
+        (1.0 - t) * box_a[3] + t * box_b[3],
+    )
+
+
+def get_interpolated_primary_detection(
+    frame_idx: int,
+    keyframes: Sequence[int],
+    det_by_frame: Dict[int, DetectionResult],
+) -> Optional[DetectionResult]:
+    if not keyframes:
+        return None
+    if frame_idx in det_by_frame:
+        return det_by_frame[frame_idx]
+
+    pos = bisect.bisect_left(keyframes, frame_idx)
+    if pos <= 0:
+        return det_by_frame[keyframes[0]]
+    if pos >= len(keyframes):
+        return det_by_frame[keyframes[-1]]
+
+    prev_idx = keyframes[pos - 1]
+    next_idx = keyframes[pos]
+    prev_det = det_by_frame[prev_idx]
+    next_det = det_by_frame[next_idx]
+    denom = float(max(1, next_idx - prev_idx))
+    t = float((frame_idx - prev_idx) / denom)
+    box = interpolate_box(prev_det.box_xyxy, next_det.box_xyxy, t)
+    score = (1.0 - t) * prev_det.score + t * next_det.score
+    return DetectionResult(label=prev_det.label, score=float(score), box_xyxy=box)
+
+
 def select_target_boxes(
     detections: Sequence[DetectionResult],
     primary_words: Sequence[str],
     context_words: Sequence[str],
     context_topk: int,
+    image_w: int,
+    image_h: int,
+    motion_map: Optional[np.ndarray],
+    prev_primary_box: Optional[Tuple[float, float, float, float]],
+    max_box_area_ratio: float,
+    subtitle_bottom_ratio: float,
+    subtitle_aspect_ratio: float,
+    motion_weight: float,
+    temporal_iou_weight: float,
+    min_motion_score: float,
 ) -> Tuple[List[DetectionResult], Optional[DetectionResult]]:
     prim = set(primary_words)
     ctx = set(context_words)
 
     primary_candidates = [d for d in detections if any(p in d.label for p in prim)]
-    selected_primary = max(primary_candidates, key=lambda x: x.score) if primary_candidates else None
+
+    def primary_rank(det: DetectionResult) -> float:
+        rank = det.score
+        area_r = box_area_ratio(det.box_xyxy, image_w, image_h)
+        if area_r > max_box_area_ratio:
+            rank -= 1.2
+        if is_subtitle_like(det.box_xyxy, image_w, image_h, subtitle_bottom_ratio, subtitle_aspect_ratio):
+            rank -= 2.0
+
+        motion_score = motion_score_in_box(motion_map, det.box_xyxy)
+        rank += motion_weight * motion_score
+        if motion_score < min_motion_score:
+            rank -= 0.4
+
+        if prev_primary_box is not None:
+            rank += temporal_iou_weight * box_iou(prev_primary_box, det.box_xyxy)
+        return rank
+
+    selected_primary = max(primary_candidates, key=primary_rank) if primary_candidates else None
 
     selected: List[DetectionResult] = []
     if selected_primary is not None:
@@ -344,6 +584,8 @@ def select_target_boxes(
         d
         for d in sorted(detections, key=lambda x: x.score, reverse=True)
         if d is not selected_primary and any(c in d.label for c in ctx)
+        and box_area_ratio(d.box_xyxy, image_w, image_h) <= max_box_area_ratio
+        and not is_subtitle_like(d.box_xyxy, image_w, image_h, subtitle_bottom_ratio, subtitle_aspect_ratio)
     ]
     selected.extend(context_candidates[: max(0, context_topk)])
 
@@ -436,6 +678,14 @@ def iter_sampled_frames(cap: cv2.VideoCapture, stride: int, max_frames: int):
             break
 
 
+def resolve_stride(frame_stride: int, sample_interval_sec: float, fps: float) -> int:
+    if sample_interval_sec is not None and sample_interval_sec > 0:
+        if fps <= 0:
+            return max(1, frame_stride)
+        return max(1, int(round(sample_interval_sec * fps)))
+    return max(1, frame_stride)
+
+
 def process_video(
     video_path: Path,
     caption_dir: Path,
@@ -475,22 +725,19 @@ def process_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
 
-    writer = None
-    if args.save_overlay_video:
-        save_root.mkdir(parents=True, exist_ok=True)
-        overlay_path = save_root / "overlay.mp4"
-        writer = cv2.VideoWriter(
-            str(overlay_path),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps / max(1, args.frame_stride),
-            (width, height),
-        )
+    effective_stride = resolve_stride(args.frame_stride, args.sample_interval_sec, fps)
 
     frame_records = []
     processed = 0
     hit_primary = 0
+    prev_gray: Optional[np.ndarray] = None
+    prev_primary_box: Optional[Tuple[float, float, float, float]] = None
+    miss_streak = 0
+    sampled_primary_by_frame: Dict[int, DetectionResult] = {}
 
-    for frame_idx, frame_bgr in iter_sampled_frames(cap, args.frame_stride, args.max_frames_per_video):
+    for frame_idx, frame_bgr in iter_sampled_frames(cap, effective_stride, args.max_frames_per_video):
+        curr_gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        motion_map = compute_motion_map(prev_gray, curr_gray)
         image_pil = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
 
         detections = detect_boxes(
@@ -509,7 +756,38 @@ def process_video(
             primary_words=primary_words,
             context_words=context_words,
             context_topk=args.context_topk,
+            image_w=width,
+            image_h=height,
+            motion_map=motion_map,
+            prev_primary_box=prev_primary_box,
+            max_box_area_ratio=args.max_box_area_ratio,
+            subtitle_bottom_ratio=args.subtitle_bottom_ratio,
+            subtitle_aspect_ratio=args.subtitle_aspect_ratio,
+            motion_weight=args.motion_weight,
+            temporal_iou_weight=args.temporal_iou_weight,
+            min_motion_score=args.min_motion_score,
         )
+
+        if primary_det is not None:
+            smoothed_box = smooth_primary_box(
+                prev_box=prev_primary_box,
+                curr_box=primary_det.box_xyxy,
+                alpha=args.smooth_alpha,
+                max_center_jump_ratio=args.max_center_jump_ratio,
+                image_w=width,
+                image_h=height,
+            )
+            primary_det = DetectionResult(label=primary_det.label, score=primary_det.score, box_xyxy=smoothed_box)
+            if selected:
+                selected[0] = primary_det
+            prev_primary_box = smoothed_box
+            miss_streak = 0
+        else:
+            miss_streak += 1
+            if prev_primary_box is not None and miss_streak <= args.track_hold_frames:
+                held = DetectionResult(label="tracked_primary", score=0.0, box_xyxy=prev_primary_box)
+                selected = [held] + selected
+                primary_det = held
 
         mask = segment_with_boxes(
             image=image_pil,
@@ -521,6 +799,7 @@ def process_video(
 
         if primary_det is not None:
             hit_primary += 1
+            sampled_primary_by_frame[frame_idx] = primary_det
 
         vis = overlay_mask_and_boxes(frame_bgr, mask, selected, primary_det)
         frame_out = frame_dir / f"{frame_idx:06d}.jpg"
@@ -528,9 +807,6 @@ def process_video(
 
         if args.save_mask_png and mask is not None:
             cv2.imwrite(str(mask_dir / f"{frame_idx:06d}.png"), mask)
-
-        if writer is not None:
-            writer.write(vis)
 
         frame_records.append(
             {
@@ -548,9 +824,33 @@ def process_video(
             }
         )
         processed += 1
+        prev_gray = curr_gray
 
     cap.release()
-    if writer is not None:
+
+    if args.save_overlay_video:
+        overlay_path = save_root / "overlay.mp4"
+        writer = cv2.VideoWriter(
+            str(overlay_path),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            max(1e-3, float(fps)),
+            (width, height),
+        )
+
+        cap_full = cv2.VideoCapture(str(video_path))
+        keyframes = sorted(sampled_primary_by_frame.keys())
+        full_idx = -1
+        while True:
+            ok, frame_full = cap_full.read()
+            if not ok:
+                break
+            full_idx += 1
+            interp_primary = get_interpolated_primary_detection(full_idx, keyframes, sampled_primary_by_frame)
+            draw_dets = [interp_primary] if interp_primary is not None else []
+            full_vis = overlay_mask_and_boxes(frame_full, None, draw_dets, interp_primary)
+            writer.write(full_vis)
+
+        cap_full.release()
         writer.release()
 
     summary = {
