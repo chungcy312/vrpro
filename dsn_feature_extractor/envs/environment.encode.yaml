@@ -1,0 +1,12 @@
+name: dsn-encode
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pytorch>=2.2
+  - torchvision
+  - pytorch-cuda=12.1
+  - numpy
+  - pip
